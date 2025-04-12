@@ -1,30 +1,36 @@
+# Monkey patch to ensure np.bool8 exists.
+import numpy as np
+if not hasattr(np, 'bool8'):
+    np.bool8 = np.bool_
+
 import random
 import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
+# Note: NumPy is already imported above for the monkey patch.
 from collections import deque
 
 # -----------------------------------------------------------------------------
 # GPU Device Selection
 # -----------------------------------------------------------------------------
-# First, try CUDA (for NVIDIA GPUs). If not available, try torch-directml (for AMD/Intel on Windows).
+# Attempt to use CUDA (NVIDIA). If not available, try DirectML (AMD/Intel on Windows);
+# otherwise, fall back to CPU.
 if torch.cuda.is_available():
     device = torch.device("cuda")
     print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
 else:
     try:
         import torch_directml as dml
-        device = dml.device()
+        device = dml.device()  
         print(f"Using DirectML device (AMD/Intel GPU): {device}")
     except ImportError:
         device = torch.device("cpu")
         print("No GPU acceleration available. Using CPU.")
 
 # -----------------------------------------------------------------------------
-# Deep Q-Network (DQN)
+# Deep Q-Network (DQN) Definition
 # -----------------------------------------------------------------------------
 class DQN(nn.Module):
     def __init__(self, state_size, action_size, hidden_size=64):
@@ -55,7 +61,6 @@ class DQNAgent:
         self.state_size = state_size
         self.action_size = action_size
         
-        # Hyperparameters
         self.lr = lr
         self.gamma = gamma
         self.epsilon = epsilon
@@ -63,10 +68,10 @@ class DQNAgent:
         self.epsilon_decay = epsilon_decay
         self.batch_size = batch_size
         
-        # Experience replay memory
+        # Experience replay memory storage:
         self.memory = deque(maxlen=memory_capacity)
 
-        # Policy and target networks setup: They both use the selected device.
+        # Policy and target networks:
         self.policy_net = DQN(state_size, action_size).to(device)
         self.target_net = DQN(state_size, action_size).to(device)
         self.update_target_network()
@@ -78,11 +83,11 @@ class DQNAgent:
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def remember(self, state, action, reward, next_state, done):
-        """Store an experience in the replay memory."""
+        """Store experience in replay memory."""
         self.memory.append((state, action, reward, next_state, done))
 
     def select_action(self, state):
-        """Epsilon-greedy action selection."""
+        """Select an action using an epsilon-greedy strategy."""
         if np.random.rand() < self.epsilon:
             return random.randrange(self.action_size)
         state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
@@ -91,7 +96,7 @@ class DQNAgent:
         return torch.argmax(q_values, dim=1).item()
 
     def replay(self):
-        """Train on a batch of experiences from the replay memory."""
+        """Sample a batch of experiences from memory and learn from them."""
         if len(self.memory) < self.batch_size:
             return None
 
@@ -102,10 +107,7 @@ class DQNAgent:
         next_states = torch.FloatTensor([exp[3] for exp in minibatch]).to(device)
         dones = torch.FloatTensor([1 if exp[4] else 0 for exp in minibatch]).to(device)
 
-        # Compute Q-values for current states and the selected actions
         current_q = self.policy_net(states).gather(1, actions).squeeze(1)
-
-        # Compute target Q-values using the target network
         with torch.no_grad():
             max_next_q = self.target_net(next_states).max(1)[0]
             target_q = rewards + self.gamma * max_next_q * (1 - dones)
@@ -115,20 +117,19 @@ class DQNAgent:
         loss.backward()
         self.optimizer.step()
 
-        # Decay epsilon for exploration
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
         return loss.item()
 
 # -----------------------------------------------------------------------------
-# State Preprocessing
+# Preprocessing: Convert Gym Blackjack state to numpy array
 # -----------------------------------------------------------------------------
 def preprocess_state(state):
     """
-    The Gym Blackjack environment returns a state tuple:
+    Expects state as a tuple of the form:
       (player_sum, dealer_card, usable_ace)
-    We convert this into a numpy array.
+    Returns a numpy array of floats.
     """
     player_sum, dealer_card, usable_ace = state
     ace_flag = 1.0 if usable_ace else 0.0
@@ -139,7 +140,6 @@ def preprocess_state(state):
 # -----------------------------------------------------------------------------
 def create_blackjack_env():
     try:
-        # Recent versions of Gym may use 'Blackjack-v1'
         env = gym.make('Blackjack-v1')
     except Exception:
         env = gym.make('Blackjack-v0')
@@ -151,22 +151,32 @@ def create_blackjack_env():
 def train_agent(num_episodes=5000, target_update_freq=10):
     env = create_blackjack_env()
     state_size = 3  # [player_sum, dealer_card, usable_ace]
-    action_size = env.action_space.n  # Typically: hit or stick
+    action_size = env.action_space.n  # Actions: hit or stick
     agent = DQNAgent(state_size, action_size)
 
     rewards_history = []
     losses_history = []
 
     for episode in range(num_episodes):
-        state = env.reset()
+        reset_result = env.reset()
+        # Handle new Gym API: if reset returns (observation, info), extract the observation.
+        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         state = preprocess_state(state)
         total_reward = 0
         done = False
 
         while not done:
             action = agent.select_action(state)
-            next_state, reward, done, _ = env.step(action)
-            # For terminal states, use a dummy next state
+            step_result = env.step(action)
+            # Handle both old Gym API (4 values) and new Gym API (5 values)
+            if len(step_result) == 4:
+                next_state, reward, done, _ = step_result
+            elif len(step_result) == 5:
+                next_state, reward, terminated, truncated, _ = step_result
+                done = terminated or truncated
+            else:
+                raise ValueError("Unexpected number of items returned by env.step()")
+
             next_state_processed = preprocess_state(next_state) if not done else np.zeros(state_size, dtype=np.float32)
             agent.remember(state, action, reward, next_state_processed, done)
             state = next_state_processed
@@ -184,9 +194,8 @@ def train_agent(num_episodes=5000, target_update_freq=10):
         if (episode + 1) % 100 == 0:
             avg_reward = np.mean(rewards_history[-100:])
             avg_loss = np.mean(losses_history[-100:]) if losses_history else 0
-            print(f"Episode {episode + 1}/{num_episodes} | "
-                  f"Avg Reward: {avg_reward:.3f} | Avg Loss: {avg_loss:.5f} | "
-                  f"Epsilon: {agent.epsilon:.3f}")
+            print(f"Episode {episode+1}/{num_episodes} | Avg Reward: {avg_reward:.3f} | "
+                  f"Avg Loss: {avg_loss:.5f} | Epsilon: {agent.epsilon:.3f}")
 
     print("Training complete.")
     return agent
@@ -200,18 +209,27 @@ def evaluate_agent(agent, num_games=1000):
     losses = 0
     draws = 0
 
-    # Use a lower exploration rate during evaluation
+    # Turn off exploration during evaluation.
     original_epsilon = agent.epsilon
     agent.epsilon = 0.0
 
     for _ in range(num_games):
-        state = env.reset()
+        reset_result = env.reset()
+        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
         state = preprocess_state(state)
         done = False
 
         while not done:
             action = agent.select_action(state)
-            next_state, reward, done, _ = env.step(action)
+            step_result = env.step(action)
+            if len(step_result) == 4:
+                next_state, reward, done, _ = step_result
+            elif len(step_result) == 5:
+                next_state, reward, terminated, truncated, _ = step_result
+                done = terminated or truncated
+            else:
+                raise ValueError("Unexpected number of items returned by env.step()")
+            
             state = preprocess_state(next_state) if not done else np.zeros(3, dtype=np.float32)
 
         if reward > 0:
@@ -224,7 +242,8 @@ def evaluate_agent(agent, num_games=1000):
     print(f"Evaluation over {num_games} games:")
     print(f"Wins: {wins}\tLosses: {losses}\tDraws: {draws}")
 
-    agent.epsilon = original_epsilon  # Restore original epsilon
+    # Restore original epsilon for future evaluations or training.
+    agent.epsilon = original_epsilon
 
 # -----------------------------------------------------------------------------
 # Main Execution
