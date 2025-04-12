@@ -24,7 +24,7 @@ The agent learns by playing games in the Gym Blackjack environment and is evalua
 
 ```
 .
-├── blackjack_dqn.py        # Main Python script for training and evaluation
+├── main.py        # Main Python script for training and evaluation
 ├── requirements.txt        # Dependencies for NVIDIA (CUDA) enabled systems
 ├── requirements2.txt       # Dependencies for Intel/AMD (DirectML) systems on Windows
 └── README.md               # This file
@@ -37,7 +37,7 @@ The agent learns by playing games in the Gym Blackjack environment and is evalua
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/blackjack-dqn.git
+git clone https://github.com/changcheng967/BlackJack-AI.git
 cd blackjack-dqn
 ```
 
@@ -83,7 +83,7 @@ pip install -r requirements2.txt
 To start training, simply run the main Python script. The training loop is set to run for 5000 episodes by default, showing periodic updates on the agent's performance:
 
 ```bash
-python blackjack_dqn.py
+python main.py
 ```
 
 During training, the agent uses an epsilon-greedy strategy to balance exploration with exploitation.
@@ -96,7 +96,7 @@ After training, the script automatically evaluates the agent over 1000 games, pr
 
 ## Customization
 
-You can adjust various hyperparameters directly in `blackjack_dqn.py`:
+You can adjust various hyperparameters directly in `main.py`:
 - **Learning Rate (`lr`)**
 - **Discount Factor (`gamma`)**
 - **Epsilon Settings (`epsilon`, `epsilon_min`, `epsilon_decay`)**
