@@ -1,0 +1,4 @@
+# Configuration
+OGS_USERNAME = 'Kata_web'  # Replace with your bot's OGS username
+OGS_API_KEY = '140871f7fa53e30b42fa272755173763ff171d73'         # Replace with your OGS API key
+API_BASE_URL = 'https://online-go.com/api/v1'

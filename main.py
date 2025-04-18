@@ -1,380 +1,349 @@
-# Monkey patch to ensure np.bool8 exists.
-import numpy as np
-if not hasattr(np, 'bool8'):
-    np.bool8 = np.bool_
-
-import random
-import gym
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from collections import deque
+import numpy as np
+import math
+import os
+import random
+from collections import defaultdict, deque
 
-# ------------------------------
-# GPU Device Selection
-# ------------------------------
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-    print(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
-else:
-    try:
-        import torch_directml as dml
-        device = dml.device()  
-        print(f"Using DirectML device (AMD/Intel GPU): {device}")
-    except ImportError:
-        device = torch.device("cpu")
-        print("No GPU acceleration available. Using CPU.")
+# 超参数配置（经过GPU优化）
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_MCTS_SIMULATIONS = 1000    # 倍增MCTS模拟次数
+NUM_SELF_PLAY_GAMES = 500      # 自我对局次数
+NUM_TRAIN_EPOCHS = 20          # 训练轮次
+BATCH_SIZE = 512               # 批处理量
+HISTORY_LEN = 7               # 延长历史记忆
+HIDDEN_SIZE = 512             # 神经网络规模
+NUM_TEST_EPOCHS = 1000         # 评估强度测试次数
 
-# ------------------------------
-# Deep Q-Network (DQN) Definition
-# ------------------------------
-class DQN(nn.Module):
-    def __init__(self, state_size, action_size, hidden_size=64):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(state_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, action_size)
-    
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
-
-# ------------------------------
-# DQN Agent
-# ------------------------------
-class DQNAgent:
-    def __init__(self,
-                 state_size,
-                 action_size,
-                 lr=0.001,
-                 gamma=0.99,
-                 epsilon=1.0,
-                 epsilon_min=0.01,
-                 epsilon_decay=0.995,
-                 memory_capacity=10000,
-                 batch_size=64):
-        self.state_size = state_size
-        self.action_size = action_size
-
-        self.lr = lr
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_min = epsilon_min
-        self.epsilon_decay = epsilon_decay
-        self.batch_size = batch_size
-
-        # Experience replay memory
-        self.memory = deque(maxlen=memory_capacity)
-
-        # Policy & target networks
-        self.policy_net = DQN(state_size, action_size).to(device)
-        self.target_net = DQN(state_size, action_size).to(device)
-        self.update_target_network()
-
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
-
-    def update_target_network(self):
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append((state, action, reward, next_state, done))
-
-    def select_action(self, state):
-        if np.random.rand() < self.epsilon:
-            return random.randrange(self.action_size)
-        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-        with torch.no_grad():
-            q_values = self.policy_net(state_tensor)
-        return torch.argmax(q_values, dim=1).item()
-
-    def replay(self):
-        if len(self.memory) < self.batch_size:
-            return None
-
-        minibatch = random.sample(self.memory, self.batch_size)
-        states = torch.FloatTensor([exp[0] for exp in minibatch]).to(device)
-        actions = torch.LongTensor([exp[1] for exp in minibatch]).unsqueeze(1).to(device)
-        rewards = torch.FloatTensor([exp[2] for exp in minibatch]).to(device)
-        next_states = torch.FloatTensor([exp[3] for exp in minibatch]).to(device)
-        dones = torch.FloatTensor([1 if exp[4] else 0 for exp in minibatch]).to(device)
-
-        current_q = self.policy_net(states).gather(1, actions).squeeze(1)
-        with torch.no_grad():
-            max_next_q = self.target_net(next_states).max(1)[0]
-            target_q = rewards + self.gamma * max_next_q * (1 - dones)
-        loss = F.mse_loss(current_q, target_q)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-
-        return loss.item()
-
-# ------------------------------
-# Gym Environment Helpers
-# ------------------------------
-def preprocess_state(state):
-    # Expects state: (player_sum, dealer_card, usable_ace)
-    player_sum, dealer_card, usable_ace = state
-    ace_flag = 1.0 if usable_ace else 0.0
-    return np.array([float(player_sum), float(dealer_card), ace_flag], dtype=np.float32)
-
-def create_blackjack_env():
-    try:
-        env = gym.make('Blackjack-v1')
-    except Exception:
-        env = gym.make('Blackjack-v0')
-    return env
-
-# ------------------------------
-# Training & Evaluation
-# ------------------------------
-def train_agent(num_episodes=5000, target_update_freq=10):
-    env = create_blackjack_env()
-    state_size = 3  # [player_sum, dealer_card, usable_ace]
-    action_size = env.action_space.n  # 0: stick, 1: hit
-    agent = DQNAgent(state_size, action_size)
-
-    rewards_history = []
-    losses_history = []
-    for episode in range(num_episodes):
-        reset_result = env.reset()
-        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-        state = preprocess_state(state)
-        total_reward = 0
-        done = False
-        while not done:
-            action = agent.select_action(state)
-            step_result = env.step(action)
-            if len(step_result) == 4:
-                next_state, reward, done, _ = step_result
-            elif len(step_result) == 5:
-                next_state, reward, terminated, truncated, _ = step_result
-                done = terminated or truncated
-            else:
-                raise ValueError("Unexpected number of items returned by env.step()")
-            next_state_processed = preprocess_state(next_state) if not done else np.zeros(3, dtype=np.float32)
-            agent.remember(state, action, reward, next_state_processed, done)
-            state = next_state_processed
-            total_reward += reward
-            loss = agent.replay()
-            if loss is not None:
-                losses_history.append(loss)
-        rewards_history.append(total_reward)
-        if (episode+1) % target_update_freq == 0:
-            agent.update_target_network()
-        if (episode+1) % 100 == 0:
-            avg_reward = np.mean(rewards_history[-100:])
-            avg_loss = np.mean(losses_history[-100:]) if losses_history else 0
-            print(f"Episode {episode+1}/{num_episodes} | Avg Reward: {avg_reward:.3f} | Avg Loss: {avg_loss:.5f} | Epsilon: {agent.epsilon:.3f}")
-    print("Training complete.")
-    return agent
-
-def evaluate_agent(agent, num_games=1000):
-    env = create_blackjack_env()
-    wins, losses, draws = 0, 0, 0
-    original_epsilon = agent.epsilon
-    agent.epsilon = 0.0  # disable exploration for evaluation
-    for _ in range(num_games):
-        reset_result = env.reset()
-        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-        state = preprocess_state(state)
-        done = False
-        while not done:
-            action = agent.select_action(state)
-            step_result = env.step(action)
-            if len(step_result) == 4:
-                next_state, reward, done, _ = step_result
-            elif len(step_result) == 5:
-                next_state, reward, terminated, truncated, _ = step_result
-                done = terminated or truncated
-            else:
-                raise ValueError("Unexpected number of items returned by env.step()")
-            state = preprocess_state(next_state) if not done else np.zeros(3, dtype=np.float32)
-        if reward > 0:
-            wins += 1
-        elif reward < 0:
-            losses += 1
-        else:
-            draws += 1
-    print(f"Evaluation over {num_games} games:")
-    print(f"Wins: {wins}\tLosses: {losses}\tDraws: {draws}")
-    agent.epsilon = original_epsilon
-
-# ------------------------------
-# Console-Based Human vs. AI (for reference)
-# ------------------------------
-def draw_card():
-    cards = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-    return random.choice(cards)
-
-def hand_value(hand):
-    total = 0
-    num_aces = 0
-    for card in hand:
-        if card in ['J', 'Q', 'K']:
-            total += 10
-        elif card == 'A':
-            total += 1
-            num_aces += 1
-        else:
-            total += int(card)
-    if num_aces > 0 and total + 10 <= 21:
-        total += 10
-        usable = True
-    else:
-        usable = False
-    return total, usable
-
-# ------------------------------
-# GUI for Human vs. AI Game Mode (Tkinter)
-# ------------------------------
-import tkinter as tk
-from tkinter import messagebox
-
-class BlackjackGUI:
-    def __init__(self, agent):
-        self.agent = agent
-        self.root = tk.Tk()
-        self.root.title("Blackjack: Human vs AI")
-        # Labels for dealer, human, AI, and messages
-        self.dealer_label = tk.Label(self.root, text="Dealer: ", font=("Helvetica", 14))
-        self.dealer_label.pack(pady=5)
-        self.human_label = tk.Label(self.root, text="Your Hand: ", font=("Helvetica", 14))
-        self.human_label.pack(pady=5)
-        self.ai_label = tk.Label(self.root, text="AI Hand: ", font=("Helvetica", 14))
-        self.ai_label.pack(pady=5)
-        self.message_label = tk.Label(self.root, text="Welcome to Blackjack!", font=("Helvetica", 14))
-        self.message_label.pack(pady=10)
-        # Buttons for actions
-        self.button_frame = tk.Frame(self.root)
-        self.button_frame.pack(pady=10)
-        self.hit_button = tk.Button(self.button_frame, text="Hit", command=self.hit, width=10, font=("Helvetica", 12))
-        self.hit_button.grid(row=0, column=0, padx=5)
-        self.stand_button = tk.Button(self.button_frame, text="Stand", command=self.stand, width=10, font=("Helvetica", 12))
-        self.stand_button.grid(row=0, column=1, padx=5)
-        self.new_round_button = tk.Button(self.root, text="New Round", command=self.new_round, width=20, font=("Helvetica", 12))
-        self.new_round_button.pack(pady=10)
-        self.game_over = False
-        self.new_round()
-    
-    def new_round(self):
-        self.human_hand = [draw_card(), draw_card()]
-        self.ai_hand = [draw_card(), draw_card()]
-        self.dealer_hand = [draw_card(), draw_card()]
-        self.game_over = False
-        self.message_label.config(text="Your turn: Hit or Stand?")
-        self.hit_button.config(state=tk.NORMAL)
-        self.stand_button.config(state=tk.NORMAL)
-        self.new_round_button.config(state=tk.DISABLED)
-        self.update_display()
+# 增强型神经网络（包含注意力机制）
+class MegaRPSNet(nn.Module):
+    def __init__(self, input_size=HISTORY_LEN*2*3, hidden_size=HIDDEN_SIZE):
+        super().__init__()
+        self.embed = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.LeakyReLU(0.2)
+        )
         
-    def update_display(self):
-        if not self.game_over:
-            dealer_text = f"Dealer: {self.dealer_hand[0]}, ?"
-        else:
-            dealer_total, _ = hand_value(self.dealer_hand)
-            dealer_text = f"Dealer: {', '.join(self.dealer_hand)} | Total: {dealer_total}"
-        self.dealer_label.config(text=dealer_text)
-        human_total, _ = hand_value(self.human_hand)
-        human_text = f"Your Hand: {', '.join(self.human_hand)} | Total: {human_total}"
-        self.human_label.config(text=human_text)
-        ai_total, _ = hand_value(self.ai_hand)
-        ai_text = f"AI Hand: {', '.join(self.ai_hand)} | Total: {ai_total}"
-        self.ai_label.config(text=ai_text)
-    
-    def hit(self):
-        if self.game_over:
-            return
-        self.human_hand.append(draw_card())
-        human_total, _ = hand_value(self.human_hand)
-        self.update_display()
-        if human_total > 21:
-            self.message_label.config(text="You busted!")
-            self.end_round()
-    
-    def stand(self):
-        if self.game_over:
-            return
-        self.hit_button.config(state=tk.DISABLED)
-        self.stand_button.config(state=tk.DISABLED)
-        self.message_label.config(text="You stand. Dealer's turn...")
-        self.root.after(1000, self.dealer_turn)
-    
-    def dealer_turn(self):
-        dealer_total, _ = hand_value(self.dealer_hand)
-        while dealer_total < 17:
-            self.dealer_hand.append(draw_card())
-            dealer_total, _ = hand_value(self.dealer_hand)
-        self.update_display()
-        self.root.after(1000, self.ai_turn)
-    
-    def ai_turn(self):
-        while True:
-            ai_total, ai_usable = hand_value(self.ai_hand)
-            dealer_card = self.dealer_hand[0]
-            if dealer_card == 'A':
-                dealer_value = 11
-            elif dealer_card in ['J', 'Q', 'K']:
-                dealer_value = 10
-            else:
-                dealer_value = int(dealer_card)
-            observation = np.array([float(ai_total), float(dealer_value), 1.0 if ai_usable else 0.0], dtype=np.float32)
-            action = self.agent.select_action(observation)
-            if action == 1:
-                self.ai_hand.append(draw_card())
-                self.update_display()
-                if hand_value(self.ai_hand)[0] > 21:
-                    break
-            else:
-                break
-        self.end_round()
-    
-    def end_round(self):
-        self.game_over = True
-        self.hit_button.config(state=tk.DISABLED)
-        self.stand_button.config(state=tk.DISABLED)
-        self.new_round_button.config(state=tk.NORMAL)
-        self.update_display()
-        dealer_total, _ = hand_value(self.dealer_hand)
-        human_total, _ = hand_value(self.human_hand)
-        ai_total, _ = hand_value(self.ai_hand)
-        if human_total > 21:
-            human_result = "Lose (Busted)"
-        elif dealer_total > 21 or human_total > dealer_total:
-            human_result = "Win"
-        elif human_total == dealer_total:
-            human_result = "Tie"
-        else:
-            human_result = "Lose"
-        if ai_total > 21:
-            ai_result = "Lose (Busted)"
-        elif dealer_total > 21 or ai_total > dealer_total:
-            ai_result = "Win"
-        elif ai_total == dealer_total:
-            ai_result = "Tie"
-        else:
-            ai_result = "Lose"
-        result_message = f"Round Over!\nDealer Total: {dealer_total}\nYour Result: {human_result}\nAI Result: {ai_result}"
-        self.message_label.config(text=result_message)
-    
-    def run(self):
-        self.root.mainloop()
+        # 注意力机制层
+        self.attention = nn.MultiheadAttention(hidden_size, num_heads=8, batch_first=True)
+        
+        # 残差块
+        self.res_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.LayerNorm(hidden_size),
+                nn.LeakyReLU(0.2),
+                nn.Dropout(0.3)
+            ) for _ in range(4)
+        ])
+        
+        # 策略头
+        self.policy_head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 3),
+            nn.Softmax(dim=-1)
+        )
+        
+        # 价值头
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+            nn.Tanh())
+        
+    def forward(self, x):
+        x = self.embed(x)
+        attn_out, _ = self.attention(x, x, x)
+        x = x + attn_out
+        
+        for block in self.res_blocks:
+            residual = x
+            x = block(x)
+            x = x + residual
+        
+        return self.policy_head(x), self.value_head(x)
 
-# ------------------------------
-# Main Execution
-# ------------------------------
-if __name__ == "__main__":
-    print("Starting training for blackjack DQN agent...")
-    agent = train_agent(num_episodes=5000)
-    print("\nEvaluating the trained agent...")
-    evaluate_agent(agent, num_games=1000)
+# 优化版MCTS（带优先经验回放）
+class TurboMCTS:
+    def __init__(self, model):
+        self.model = model
+        self.Q = defaultdict(float)
+        self.N = defaultdict(int)
+        self.children = dict()
+        self.c_puct = 3.5  # 动态调整探索系数
+        
+    def search(self, state):
+        for _ in range(NUM_MCTS_SIMULATIONS):
+            self._rollout(state)
+        
+        node = self._get_node(state)
+        counts = np.array([self.N[(node, a)] for a in range(3)])
+        probs = counts ** 1.5 / (counts ** 1.5).sum()  # 温度采样
+        return probs
     
-    gui_choice = input("\nDo you want to play the GUI version (human vs AI)? (y/n): ").strip().lower()
-    if gui_choice == "y":
-        app = BlackjackGUI(agent)
-        app.run()
+    def _rollout(self, state):
+        path = []
+        node = self._get_node(state)
+        while True:
+            if node not in self.children:
+                v = self._expand(node)
+                self._backpropagate(path, v)
+                return
+            
+            action = self._select_action(node)
+            path.append((node, action))
+            node = self._next_state(node, action)
+    
+    def _expand(self, node):
+        with torch.no_grad():
+            state_tensor = self._state_to_tensor(node)
+            policy, value = self.model(state_tensor)
+        
+        self.children[node] = list(range(3))
+        for a in range(3):
+            self.N[(node, a)] = 1 + int(10 * policy[0][a].item())  # 优先初始化
+            self.Q[(node, a)] = policy[0][a].item() * 2 - 1  # 归一化
+        return value.item()
+    
+    def _select_action(self, node):
+        total_n = math.sqrt(sum(self.N[(node, a)] for a in range(3)) + 1e-8)
+        self.c_puct = 4.0 - 3.0 * (1 / (1 + math.exp(-total_n/50)))  # 动态探索
+        
+        best_score = -np.inf
+        best_action = 0
+        for a in range(3):
+            q = self.Q[(node, a)]
+            n = self.N[(node, a)]
+            score = q + self.c_puct * math.sqrt(total_n) / (n + 1)
+            if score > best_score:
+                best_score = score
+                best_action = a
+        return best_action
+    
+    def _backpropagate(self, path, value):
+        for node, action in reversed(path):
+            self.N[(node, action)] += 1
+            self.Q[(node, action)] += (value - self.Q[(node, action)]) / self.N[(node, action)]
+    
+    @staticmethod
+    def _get_node(state): return tuple(state)
+    
+    @staticmethod
+    def _next_state(state, action):
+        return state[2:] + (action, (action + 1) % 3 if random.random() < 0.7 else random.choice([0,1,2]))
+    
+    @staticmethod
+    def _state_to_tensor(state):
+        arr = np.zeros(HISTORY_LEN*2*3, dtype=np.float32)
+        for i in range(min(HISTORY_LEN*2, len(state))):
+            val = state[i] if state[i] is not None else 0
+            arr[i*3 + int(val)] = 1.0
+        return torch.FloatTensor(arr).unsqueeze(0).to(DEVICE)
+
+# 终极训练系统
+class AlphaRPS:
+    def __init__(self):
+        self.model = MegaRPSNet().to(DEVICE)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=5e-4, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100)
+        self.memory = deque(maxlen=100000)
+        self.elo = 1500
+        self.best_elo = 1500
+        
+        if os.path.exists("alpha_rps.pth"):
+            self.model.load_state_dict(torch.load("alpha_rps.pth"))
+            print("载入已训练模型！")
+    
+    def generate_experience(self):
+        print("生成高级训练数据...")
+        states = [tuple(0 for _ in range(HISTORY_LEN*2)) for _ in range(NUM_SELF_PLAY_GAMES)]
+        
+        with torch.no_grad():
+            for _ in range(15):  # 多轮自我进化
+                next_states = []
+                mcts = TurboMCTS(self.model)
+                
+                for state in states:
+                    probs = mcts.search(state)
+                    action = np.random.choice(3, p=probs)
+                    opp_action = self._genius_opponent(state)
+                    
+                    state_tensor = TurboMCTS._state_to_tensor(state)
+                    _, value = self.model(state_tensor)
+                    self.memory.append((state_tensor.cpu(), probs, value.item()))
+                    
+                    next_state = state[2:] + (action, opp_action)
+                    next_states.append(next_state)
+                
+                states = next_states
+    
+    def _genius_opponent(self, state):
+        # 混合多种高级策略
+        rand = random.random()
+        if rand < 0.2:
+            return random.choice([0,1,2])
+        elif rand < 0.5:
+            return (state[-2] + 1) % 3 if len(state)>=2 else 0
+        elif rand < 0.8:
+            return self._pattern_counter(state)
+        else:
+            return (self._meta_predict(state) + 1) % 3
+    
+    def _pattern_counter(self, state):
+        if len(state) < 4: return random.choice([0,1,2])
+        patterns = defaultdict(int)
+        for i in range(len(state)-2):
+            key = tuple(state[i:i+2])
+            patterns[key] += 1
+        if not patterns: return random.choice([0,1,2])
+        most_common = max(patterns, key=patterns.get)
+        return (most_common[-1] + 1) % 3
+    
+    def _meta_predict(self, state):
+        with torch.no_grad():
+            state_tensor = TurboMCTS._state_to_tensor(state)
+            policy, _ = self.model(state_tensor)
+        return torch.argmax(policy).item()
+    
+    def train(self):
+        if len(self.memory) < BATCH_SIZE:
+            return
+        
+        batch = random.sample(self.memory, BATCH_SIZE)
+        states = torch.cat([x[0] for x in batch]).to(DEVICE)
+        target_p = torch.FloatTensor([x[1] for x in batch]).to(DEVICE)
+        target_v = torch.FloatTensor([x[2] for x in batch]).unsqueeze(1).to(DEVICE)
+        
+        for _ in range(NUM_TRAIN_EPOCHS):
+            p, v = self.model(states)
+            
+            # 双损失函数
+            policy_loss = -torch.mean(torch.sum(target_p * torch.log(p + 1e-9), dim=1)
+            value_loss = 0.5 * torch.mean((v - target_v)**2)
+            entropy_loss = 0.1 * torch.mean(torch.sum(p * torch.log(p + 1e-9), dim=1)
+            
+            total_loss = policy_loss + value_loss - entropy_loss
+            
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 2.0)
+            self.optimizer.step()
+        
+        self.scheduler.step()
+        torch.save(self.model.state_dict(), "alpha_rps.pth")
+    
+    def evaluate(self):
+        test_strategies = {
+            "随机玩家": lambda s: np.random.choice(3),
+            "循环战术": lambda s: (s[-2]+1)%3 if len(s)>=2 else 0,
+            "二阶反制": lambda s: ((s[-4]+1)%3 if len(s)>=4 else 0),
+            "统计预测": self._pattern_counter,
+            "元策略": self._meta_predict,
+            "人类模式": lambda s: (s[-1]+1)%3 if len(s)>=1 else 0
+        }
+        
+        total_score = 0
+        print("\n=== 超强测试协议 ===")
+        for name, strategy in test_strategies.items():
+            wins = 0
+            for _ in range(NUM_TEST_EPOCHS):
+                state = self._get_initial_state()
+                ai_action = self.predict(state)
+                opp_action = strategy(state)
+                
+                result = (ai_action - opp_action) %3
+                if result ==1: wins +=1
+                elif result ==2: wins -=1
+                
+                state = state[2:] + (ai_action, opp_action)
+            
+            win_rate = wins / NUM_TEST_EPOCHS
+            self._update_elo(win_rate)
+            total_score += wins
+            print(f"对抗 {name.ljust(8)} 胜率: {win_rate*100:6.2f}%")
+        
+        print("====================")
+        return self.elo
+    
+    def _update_elo(self, win_rate, K=32):
+        expected = 1 / (1 + 10**((1500 - self.elo)/400))
+        delta = K * (win_rate - expected)
+        self.elo += delta
+        self.best_elo = max(self.best_elo, self.elo)
+    
+    def predict(self, state):
+        with torch.no_grad():
+            state_tensor = TurboMCTS._state_to_tensor(state)
+            p, _ = self.model(state_tensor)
+        return torch.argmax(p).item()
+    
+    def _get_initial_state(self):
+        return tuple(0 for _ in range(HISTORY_LEN*2))
+
+# 游戏界面
+def main():
+    ai = AlphaRPS()
+    print(f"初始化等级分: {ai.elo}")
+    
+    while True:
+        print("\n==== 超强AI训练系统 ====")
+        print(f"当前等级分: {ai.elo:.0f} (历史最佳: {ai.best_elo:.0f})")
+        print("1. 对战")
+        print("2. 强化训练")
+        print("3. 终极测试")
+        print("4. 退出")
+        
+        choice = input("选择: ")
+        
+        if choice == '1':
+            state = ai._get_initial_state()
+            score = 0
+            for _ in range(10):
+                human = input("你的选择 (0=石头, 1=布, 2=剪刀, q=退出): ").strip()
+                if human.lower() == 'q': break
+                
+                try:
+                    human = int(human)
+                    if human not in [0,1,2]: raise ValueError
+                except:
+                    print("无效输入!")
+                    continue
+                
+                ai_action = ai.predict(state)
+                result = (ai_action - human) %3
+                
+                print(f"\nAI出: {['石头','布','剪刀'][ai_action]} vs 你出: {['石头','布','剪刀'][human]}")
+                if result ==1:
+                    print("AI碾压胜利！")
+                    score -=1
+                elif result ==2:
+                    print("奇迹胜利！")
+                    score +=1
+                else:
+                    print("平局！")
+                
+                state = state[2:] + (ai_action, human)
+            
+            print(f"\n本轮净胜: {score} 分")
+        
+        elif choice == '2':
+            print("启动超强训练模式...")
+            ai.generate_experience()
+            ai.train()
+            print(f"训练完成！当前等级分: {ai.elo:.0f}")
+        
+        elif choice == '3':
+            print("执行终极强度测试...")
+            ai.evaluate()
+            print(f"最终等级分: {ai.elo:.0f}")
+        
+        elif choice == '4':
+            print("退出系统")
+            break
+
+if __name__ == "__main__":
+    main()
